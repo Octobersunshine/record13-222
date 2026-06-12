@@ -3,108 +3,211 @@ import redis
 from ad_frequency_control import AdFrequencyControl, FrequencyPeriod
 
 
-def demo_single_shard(r):
+def _cleanup(r):
+    for key in r.scan_iter("ad_freq:*"):
+        r.delete(key)
+    for key in r.scan_iter("ad_click:*"):
+        r.delete(key)
+
+
+def demo_dynamic_frequency_cap(r):
     print("=" * 70)
-    print("  【模式一】单分片（shards=1）— 传统模式，热 key 风险")
-    print("=" * 70)
-    fc = AdFrequencyControl(r, daily_limit=5, weekly_limit=20, shards=1, local_cache_capacity=0)
-    ad_id = "ad_hot_01"
-    user_id = "user_100"
-    fc.reset(ad_id, user_id)
-
-    for i in range(5):
-        fc.check_and_record(ad_id, user_id)
-
-    dist = fc.get_shard_distribution(ad_id, user_id, FrequencyPeriod.DAILY)
-    print(f"  Redis key 数量: {len(dist)}")
-    for k, v in dist.items():
-        print(f"    {k} = {v}")
-    print(f"  总曝光次数: {fc.get_count(ad_id, user_id, FrequencyPeriod.DAILY)}")
-    print("  → 所有流量集中在 1 个 key，集群下会形成热 key\n")
-    fc.reset(ad_id, user_id)
-
-
-def demo_sharded_counter(r):
-    print("=" * 70)
-    print("  【模式二】分片计数器（shards=10）— 解决热 key 问题")
-    print("=" * 70)
-    fc = AdFrequencyControl(r, daily_limit=50, weekly_limit=200, shards=10, local_cache_capacity=0)
-    ad_id = "ad_hot_01"
-    user_id = "user_200"
-    fc.reset(ad_id, user_id)
-
-    for i in range(50):
-        fc.check_and_record(ad_id, user_id)
-
-    dist = fc.get_shard_distribution(ad_id, user_id, FrequencyPeriod.DAILY)
-    print(f"  Redis key 数量: {len(dist)}")
-    for k, v in dist.items():
-        bar = "█" * v
-        print(f"    {k.split(':')[-1]:>3} = {v:>2}  {bar}")
-    total = fc.get_count(ad_id, user_id, FrequencyPeriod.DAILY)
-    print(f"  总曝光次数: {total}")
-    print("  → 流量分散到 10 个 key，集群下可分布到不同节点\n")
-    fc.reset(ad_id, user_id)
-
-
-def demo_local_cache(r):
-    print("=" * 70)
-    print("  【模式三】分片 + 本地缓存 — 读写双优化")
+    print("  【动态频控】点击过广告的用户阈值降低")
     print("=" * 70)
     fc = AdFrequencyControl(
         r,
-        daily_limit=100,
-        weekly_limit=500,
-        shards=5,
+        daily_limit=10,
+        weekly_limit=30,
+        clicked_daily_limit=3,
+        clicked_weekly_limit=8,
+        shards=1,
+        local_cache_capacity=0,
+    )
+    ad_id = "ad_dyn_01"
+    user_id = "user_dyn_100"
+    fc.reset(ad_id, user_id)
+    fc.reset_click(ad_id, user_id)
+
+    print(f"  日限额: 基础={fc.rules[FrequencyPeriod.DAILY].max_impressions}, "
+          f"点击后={fc.rules[FrequencyPeriod.DAILY].clicked_max_impressions}")
+    print(f"  周限额: 基础={fc.rules[FrequencyPeriod.WEEKLY].max_impressions}, "
+          f"点击后={fc.rules[FrequencyPeriod.WEEKLY].clicked_max_impressions}")
+    print()
+
+    print("  —— 阶段 A：用户未点击，正常高阈值曝光 ——")
+    for i in range(5):
+        r1 = fc.check_and_record(ad_id, user_id)
+        limit = r1["details"]["daily"]["limit"]
+        count = r1["details"]["daily"]["current_count"]
+        tag = " [点击用户阈值]" if r1.get("clicked") else ""
+        print(f"    曝光 #{i + 1}: count={count}, limit={limit}{tag}")
+
+    print(f"  用户点击广告前 has_clicked = {fc.has_clicked(ad_id, user_id)}")
+    print()
+
+    print("  —— 阶段 B：用户点击广告，记录点击状态 ——")
+    was_new = fc.record_click(ad_id, user_id)
+    print(f"  record_click 返回 was_new={was_new}")
+    print(f"  点击后 has_clicked = {fc.has_clicked(ad_id, user_id)}")
+    print()
+
+    print("  —— 阶段 C：点击后阈值立刻降低，继续曝光 ——")
+    for i in range(5):
+        r1 = fc.check_and_record(ad_id, user_id)
+        limit = r1["details"]["daily"]["limit"]
+        count = r1["details"]["daily"]["current_count"]
+        allowed = r1["allowed"]
+        status = "✓ 曝光" if allowed else "✗ 拦截"
+        tag = " [点击用户阈值]" if r1.get("clicked") else ""
+        print(f"    曝光 #{5 + i + 1}: count={count}, limit={limit}{tag}  → {status}")
+        if not allowed:
+            break
+
+    final = fc.check(ad_id, user_id)
+    print()
+    print(f"  最终状态: allowed={final['allowed']}, clicked={final['clicked']}")
+    print(f"  daily: count={final['details']['daily']['current_count']} "
+          f"/ limit={final['details']['daily']['limit']} "
+          f"(base={final['details']['daily']['base_limit']})")
+    print(f"  weekly: count={final['details']['weekly']['current_count']} "
+          f"/ limit={final['details']['weekly']['limit']} "
+          f"(base={final['details']['weekly']['base_limit']})")
+    print()
+    fc.reset(ad_id, user_id)
+    fc.reset_click(ad_id, user_id)
+
+
+def demo_dynamic_with_sharding(r):
+    print("=" * 70)
+    print("  【组合】动态频控 + 分片计数器 + 本地缓存")
+    print("=" * 70)
+    fc = AdFrequencyControl(
+        r,
+        daily_limit=20,
+        weekly_limit=100,
+        clicked_daily_limit=5,
+        clicked_weekly_limit=20,
+        shards=8,
         local_cache_capacity=1000,
         local_cache_ttl=3,
     )
-    ad_id = "ad_hot_02"
-    user_id = "user_300"
+    ad_id = "ad_dyn_02"
+    user_id = "user_dyn_200"
     fc.reset(ad_id, user_id)
+    fc.reset_click(ad_id, user_id)
 
-    print("  第 1 次 check（未命中缓存，访问 Redis）")
-    result = fc.check(ad_id, user_id)
-    print(f"    daily.count = {result['details']['daily']['current_count']}")
-
-    print("  连续写入 10 次（更新本地缓存）")
-    for _ in range(10):
+    for _ in range(3):
         fc.check_and_record(ad_id, user_id)
 
-    print("  第 2 次 check（命中本地缓存）")
-    result = fc.check(ad_id, user_id)
-    print(f"    daily.count = {result['details']['daily']['current_count']}")
+    print(f"  点击前: has_clicked={fc.has_clicked(ad_id, user_id)}, "
+          f"daily.count={fc.get_count(ad_id, user_id, FrequencyPeriod.DAILY)}")
 
-    print("  清空本地缓存后重新 check（回源 Redis）")
-    fc.clear_local_cache()
-    result = fc.check(ad_id, user_id)
-    print(f"    daily.count = {result['details']['daily']['current_count']}")
+    fc.record_click(ad_id, user_id)
+
+    for _ in range(5):
+        r1 = fc.check_and_record(ad_id, user_id)
+        if not r1["allowed"]:
+            print(f"  达到点击后阈值 (count={r1['details']['daily']['current_count']}, "
+                  f"limit={r1['details']['daily']['limit']}) 停止")
+            break
 
     dist = fc.get_shard_distribution(ad_id, user_id, FrequencyPeriod.DAILY)
-    print(f"  分片分布: {[v for v in dist.values()]}")
-    print("  → 本地缓存大幅降低 Redis 读压力，分片降低写压力\n")
+    print(f"  分片分布 (共 {len(dist)} 片): {[v for v in dist.values()]}")
+    final = fc.check(ad_id, user_id)
+    print(f"  最终 daily: count={final['details']['daily']['current_count']} "
+          f"/ limit={final['details']['daily']['limit']} "
+          f"(base={final['details']['daily']['base_limit']})")
+    print()
     fc.reset(ad_id, user_id)
+    fc.reset_click(ad_id, user_id)
 
 
-def demo_frequency_cap_still_works(r):
+def demo_reset_click(r):
     print("=" * 70)
-    print("  【验证】分片模式下频控逻辑依然有效")
+    print("  【重置点击】清除点击状态后阈值恢复")
     print("=" * 70)
-    fc = AdFrequencyControl(r, daily_limit=5, weekly_limit=10, shards=8, local_cache_capacity=0)
-    ad_id = "ad_hot_03"
-    user_id = "user_400"
+    fc = AdFrequencyControl(
+        r,
+        daily_limit=10,
+        clicked_daily_limit=2,
+        shards=1,
+        local_cache_capacity=0,
+    )
+    ad_id = "ad_dyn_03"
+    user_id = "user_dyn_300"
+    fc.reset(ad_id, user_id)
+    fc.reset_click(ad_id, user_id)
+
+    fc.record_click(ad_id, user_id)
+    r1 = fc.check(ad_id, user_id)
+    print(f"  点击后: limit={r1['details']['daily']['limit']} (base={r1['details']['daily']['base_limit']})")
+
+    fc.reset_click(ad_id, user_id)
+    r2 = fc.check(ad_id, user_id)
+    print(f"  重置点击: limit={r2['details']['daily']['limit']} (base={r2['details']['daily']['base_limit']})")
+    print()
     fc.reset(ad_id, user_id)
 
-    print("  日限额 = 5，分片数 = 8")
-    for i in range(10):
-        result = fc.check_and_record(ad_id, user_id)
-        status = "✓ 记录成功" if result["recorded"] else "✗ 被拒绝"
-        print(f"    第 {i + 1:>2} 次: {status}  count={result['details']['daily']['current_count']}")
 
-    total = fc.get_count(ad_id, user_id, FrequencyPeriod.DAILY)
-    print(f"  最终日曝光总数: {total}")
-    print("  → 分片模式下频控仍然生效（可能有 1~N 次的超售误差，可接受）\n")
+def demo_set_limit_dynamic(r):
+    print("=" * 70)
+    print("  【动态修改阈值】set_limit 支持点击后阈值")
+    print("=" * 70)
+    fc = AdFrequencyControl(r, daily_limit=10, clicked_daily_limit=5)
+    ad_id = "ad_dyn_04"
+    user_id = "user_dyn_400"
     fc.reset(ad_id, user_id)
+    fc.reset_click(ad_id, user_id)
+
+    fc.record_click(ad_id, user_id)
+    r1 = fc.check(ad_id, user_id)
+    print(f"  修改前: limit={r1['details']['daily']['limit']} (base={r1['details']['daily']['base_limit']})")
+
+    fc.set_limit(FrequencyPeriod.DAILY, max_impressions=20, clicked_max_impressions=3)
+    r2 = fc.check(ad_id, user_id)
+    print(f"  修改后: limit={r2['details']['daily']['limit']} (base={r2['details']['daily']['base_limit']})")
+    print()
+    fc.reset(ad_id, user_id)
+    fc.reset_click(ad_id, user_id)
+
+
+def demo_batch_check_with_click(r):
+    print("=" * 70)
+    print("  【批量检查】支持动态频控 (部分广告点击过)")
+    print("=" * 70)
+    fc = AdFrequencyControl(
+        r,
+        daily_limit=10,
+        weekly_limit=30,
+        clicked_daily_limit=2,
+        clicked_weekly_limit=6,
+        shards=4,
+        local_cache_capacity=0,
+    )
+    ad_ids = ["ad_batch_01", "ad_batch_02", "ad_batch_03"]
+    user_id = "user_dyn_500"
+    for aid in ad_ids:
+        fc.reset(aid, user_id)
+        fc.reset_click(aid, user_id)
+
+    for aid in ad_ids:
+        for _ in range(3):
+            fc.check_and_record(aid, user_id)
+
+    fc.record_click("ad_batch_02", user_id)
+
+    results = fc.batch_check(ad_ids, user_id)
+    for aid, res in results.items():
+        clicked_str = "点击用户" if res.get("clicked") else "普通用户"
+        d = res["details"]["daily"]
+        print(f"  {aid}: {clicked_str:6}  count={d['current_count']:>2} "
+              f"/ limit={d['limit']:>2} (base={d['base_limit']:>2})  "
+              f"allowed={res['allowed']}")
+
+    print()
+    for aid in ad_ids:
+        fc.reset(aid, user_id)
+        fc.reset_click(aid, user_id)
 
 
 def main():
@@ -113,21 +216,18 @@ def main():
         r.ping()
     except redis.ConnectionError:
         print("无法连接 Redis (localhost:6379)，请先启动 Redis 服务。")
-        print("下面以静态方式展示分片逻辑的原理...")
         _print_principle()
         return
 
-    test_prefix = "ad_freq"
-    for key in r.scan_iter(f"{test_prefix}:*"):
-        r.delete(key)
+    _cleanup(r)
 
-    demo_single_shard(r)
-    demo_sharded_counter(r)
-    demo_local_cache(r)
-    demo_frequency_cap_still_works(r)
+    demo_dynamic_frequency_cap(r)
+    demo_dynamic_with_sharding(r)
+    demo_reset_click(r)
+    demo_set_limit_dynamic(r)
+    demo_batch_check_with_click(r)
 
-    for key in r.scan_iter(f"{test_prefix}:*"):
-        r.delete(key)
+    _cleanup(r)
 
     print("=" * 70)
     print("  全部 Demo 完成")
@@ -137,33 +237,43 @@ def main():
 def _print_principle():
     print("""
 ╔══════════════════════════════════════════════════════════════════╗
-║                    热 key 问题 & 解决方案                         ║
+║                     动态频控功能原理                              ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║                                                                  ║
-║  【问题】                                                         ║
-║  热门广告的曝光计数 key 集中在单个 Redis 节点，                    ║
-║  造成该节点 CPU/带宽饱和，形成瓶颈。                              ║
+║  【目标】点击过广告的用户，频控阈值自动降低，避免广告骚扰。         ║
 ║                                                                  ║
-║  【方案一：分片计数器（Sharded Counter）】                        ║
-║  将 1 个逻辑 key 拆成 N 个物理分片:                               ║
-║    ad_freq:ad_001:user_123:daily:20260612                        ║
-║      → ad_freq:ad_001:user_123:daily:20260612:0                  ║
-║      → ad_freq:ad_001:user_123:daily:20260612:1                  ║
-║      → ad_freq:ad_001:user_123:daily:20260612:2                  ║
-║      ... 共 N 个                                                 ║
+║  【点击状态存储】                                                 ║
+║    key:  ad_click:{ad_id}:{user_id}                              ║
+║    TTL:  click_ttl_days (默认 30 天)                             ║
+║    语义: 只要 key 存在即表示用户在过去 N 天内点过该广告            ║
 ║                                                                  ║
-║  • 写入：随机选一个分片 INCR（O(1)，分散写压力）                  ║
-║  • 读取：MGET 所有分片并求和（O(N)，N 通常=10~100）              ║
-║  • 效果：写入 QPS 分散到 N 个节点                                 ║
+║  【阈值规则】                                                     ║
+║    FrequencyRule 维护两套阈值:                                    ║
+║      • max_impressions            — 未点击用户的基础阈值          ║
+║      • clicked_max_impressions    — 点击用户的降级阈值            ║
+║    resolve(clicked: bool) → int                                  ║
 ║                                                                  ║
-║  【方案二：本地缓存（Local Cache）】                              ║
-║  在进程内缓存计数结果（LRU + TTL），                              ║
-║  进一步降低 Redis 读压力，适合读多写少场景。                      ║
+║  【典型场景】                                                     ║
+║    未点击用户: 日/10 次  周/30 次                                 ║
+║    点击用户  : 日/3 次   周/8 次   ← 降低 70%                     ║
 ║                                                                  ║
-║  【权衡】                                                         ║
-║  • 分片模式下，并发写入可能导致轻微超售（误差≤分片数-1）          ║
-║  • 广告频控场景对小比例超售容忍度高，适合本方案                    ║
-║  • 若需精确控制，可设 shards=1（退化为传统模式）                  ║
+║  【对外新增 API】                                                 ║
+║    record_click(ad_id, user_id)     — 记录点击                   ║
+║    has_clicked(ad_id, user_id)      — 查询点击状态               ║
+║    reset_click(ad_id, user_id)      — 重置点击状态               ║
+║    set_limit(..., clicked_max=...)  — 动态修改点击阈值           ║
+║                                                                  ║
+║  【返回字段增强】                                                 ║
+║    每次 check/check_and_record 返回中新增:                        ║
+║      • clicked                    该用户是否点过广告              ║
+║      • details.*.limit            实际生效的阈值                  ║
+║      • details.*.base_limit       基础阈值 (对比用)               ║
+║      • details.*.applied_clicked_threshold  是否使用点击阈值     ║
+║                                                                  ║
+║  【与分片/本地缓存兼容】                                          ║
+║    点击状态与频控计数相互独立，任意组合:                          ║
+║    shards=1 + cache=0   → 传统精确频控 + 动态阈值                ║
+║    shards=16 + cache=on → 集群大规模场景 + 动态阈值              ║
 ║                                                                  ║
 ╚══════════════════════════════════════════════════════════════════╝
     """)
